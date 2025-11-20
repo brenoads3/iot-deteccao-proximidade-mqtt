@@ -1,2 +1,209 @@
-codigo/.keep
+// Projeto: Sistema Inteligente de Detecção de Proximidade com ESP32 e MQTT
+// Autor: Breno Souza
+// Descrição: Mede distância com o sensor ultrassônico HC-SR04 e
+// publica os dados via MQTT. Também recebe comandos MQTT para acender/apagar um LED.
+
+// ===================== BIBLIOTECAS =====================
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// ===================== CONFIGURAÇÕES DE WIFI =====================
+// ATENÇÃO: Substitua com o nome e a senha da sua rede Wi-Fi
+const char* WIFI_SSID     = "SEU_SSID_AQUI";
+const char* WIFI_PASSWORD = "SUA_SENHA_AQUI";
+
+// ===================== CONFIGURAÇÕES DE MQTT =====================
+// Você pode usar um broker local (Mosquitto) ou um broker público (ex.: test.mosquitto.org)
+const char* MQTT_BROKER   = "test.mosquitto.org";  // altere se usar outro broker
+const uint16_t MQTT_PORT  = 1883;
+
+// Tópicos MQTT
+const char* TOPICO_DISTANCIA = "esp32/distancia";
+const char* TOPICO_LED       = "esp32/led";
+
+// ===================== PINOS DO HARDWARE =====================
+const int PINO_TRIG = 5;   // TRIG do HC-SR04
+const int PINO_ECHO = 18;  // ECHO do HC-SR04
+const int PINO_LED  = 2;   // LED (com resistor de 220 Ω até o GND)
+
+// Intervalo entre medições de distância (em milissegundos)
+const unsigned long INTERVALO_MEDICAO = 1000;
+
+// ===================== OBJETOS GLOBAIS =====================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+unsigned long ultimoEnvio = 0;
+
+// ===================== FUNÇÕES AUXILIARES =====================
+
+// Conecta ao Wi-Fi
+void conectaWiFi() {
+  Serial.print("Conectando ao WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi conectado!");
+  Serial.print("IP obtido: ");
+  Serial.println(WiFi.localIP());
+}
+
+// Callback executado quando uma mensagem é recebida em algum tópico inscrito
+void callbackMQTT(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Mensagem recebida no tópico [");
+  Serial.print(topic);
+  Serial.print("]: ");
+
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  Serial.println(msg);
+
+  // Controle do LED pelo tópico esp32/led
+  if (String(topic) == TOPICO_LED) {
+    msg.trim();
+    if (msg == "1") {
+      digitalWrite(PINO_LED, HIGH);
+      Serial.println("LED LIGADO via MQTT");
+    } else if (msg == "0") {
+      digitalWrite(PINO_LED, LOW);
+      Serial.println("LED DESLIGADO via MQTT");
+    } else {
+      Serial.println("Comando inválido para o LED. Use '1' ou '0'.");
+    }
+  }
+}
+
+// Conecta ao broker MQTT (com tentativa de reconexão)
+void conectaMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Conectando ao broker MQTT em ");
+    Serial.print(MQTT_BROKER);
+    Serial.print(":");
+    Serial.print(MQTT_PORT);
+    Serial.println(" ...");
+
+    // clientId único para cada dispositivo (pode personalizar)
+    String clientId = "ESP32-Proximidade-";
+    clientId += String(random(0xffff), HEX);
+
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("Conectado ao MQTT com sucesso!");
+
+      // Inscreve no tópico de controle do LED
+      mqttClient.subscribe(TOPICO_LED);
+      Serial.print("Inscrito no tópico: ");
+      Serial.println(TOPICO_LED);
+    } else {
+      Serial.print("Falha na conexão MQTT, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" Tentando novamente em 5 segundos...");
+      delay(5000);
+    }
+  }
+}
+
+// Faz a leitura da distância em centímetros usando o HC-SR04
+float lerDistanciaCM() {
+  // Garante nível baixo no TRIG
+  digitalWrite(PINO_TRIG, LOW);
+  delayMicroseconds(2);
+
+  // Pulso de 10us no TRIG
+  digitalWrite(PINO_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PINO_TRIG, LOW);
+
+  // Mede o tempo em microssegundos do pulso no ECHO
+  // Timeout de 25.000us (~4 metros)
+  long duracao = pulseIn(PINO_ECHO, HIGH, 25000);
+
+  if (duracao == 0) {
+    // Sem leitura válida
+    return -1.0;
+  }
+
+  // Conversão: distância (cm) = (tempo(us) * velocidade_som_cm_us) / 2
+  // Velocidade do som ~ 0,0343 cm/us
+  float distancia = (duracao * 0.0343) / 2.0;
+
+  return distancia;
+}
+
+// Publica a distância no tópico MQTT
+void publicaDistancia(float distancia) {
+  if (distancia < 0) {
+    Serial.println("Falha na leitura do sensor HC-SR04");
+    return;
+  }
+
+  // Converte para string
+  char msg[32];
+  dtostrf(distancia, 4, 2, msg);
+
+  Serial.print("Publicando distancia (cm): ");
+  Serial.println(msg);
+
+  mqttClient.publish(TOPICO_DISTANCIA, msg);
+}
+
+// ===================== FUNÇÕES PRINCIPAIS =====================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PINO_TRIG, OUTPUT);
+  pinMode(PINO_ECHO, INPUT);
+  pinMode(PINO_LED, OUTPUT);
+
+  digitalWrite(PINO_LED, LOW);
+
+  // Conecta WiFi
+  conectaWiFi();
+
+  // Configura MQTT
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(callbackMQTT);
+
+  // Tenta conectar ao MQTT
+  conectaMQTT();
+
+  Serial.println("Sistema de detecção de proximidade iniciado.");
+}
+
+void loop() {
+  // Garante que o cliente MQTT permaneça conectado
+  if (!mqttClient.connected()) {
+    conectaMQTT();
+  }
+  mqttClient.loop();
+
+  // Envia a distância a cada INTERVALO_MEDICAO
+  unsigned long agora = millis();
+  if (agora - ultimoEnvio >= INTERVALO_MEDICAO) {
+    ultimoEnvio = agora;
+
+    float distancia = lerDistanciaCM();
+
+    Serial.print("Distancia medida: ");
+    if (distancia < 0) {
+      Serial.println("SEM LEITURA");
+    } else {
+      Serial.print(distancia);
+      Serial.println(" cm");
+    }
+
+    publicaDistancia(distancia);
+  }
+}
+
 
